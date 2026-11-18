@@ -5,6 +5,7 @@ Shows: headers, sections (with Shannon entropy), imports, exports.
 Usage:  python binparse.py <file> [--json]
 """
 import argparse
+import hashlib
 import json
 import math
 import struct
@@ -46,6 +47,76 @@ def verdict(e: float) -> str:
     if e > 6.8:
         return "high"
     return ""
+
+
+# --------------------------------------------------------------------------
+# analysis: imphash + heuristics
+# --------------------------------------------------------------------------
+def imphash(imports: dict):
+    """Import hash (same scheme as pefile/VirusTotal, minus ordinal lookup tables)."""
+    parts = []
+    for dll, funcs in imports.items():
+        base = dll.lower()
+        for ext in (".dll", ".ocx", ".sys"):
+            if base.endswith(ext):
+                base = base[:-len(ext)]
+        for fn in funcs:
+            fn = f"ord{fn[1:]}" if fn.startswith("#") else fn
+            parts.append(f"{base}.{fn.lower()}")
+    return hashlib.md5(",".join(parts).encode()).hexdigest() if parts else None
+
+
+# group -> (APIs, min distinct hits to report)
+API_GROUPS = {
+    "process injection": ({"virtualallocex", "writeprocessmemory", "createremotethread",
+                           "ntunmapviewofsection", "queueuserapc", "setthreadcontext",
+                           "ntwritevirtualmemory", "rtlcreateuserthread"}, 2),
+    "anti-debug": ({"isdebuggerpresent", "checkremotedebuggerpresent",
+                    "ntqueryinformationprocess", "outputdebugstringa",
+                    "ntsetinformationthread", "ptrace"}, 1),
+    "dynamic API resolving": ({"getprocaddress", "loadlibrarya", "loadlibraryw",
+                               "loadlibraryexa", "loadlibraryexw", "ldrloaddll",
+                               "dlopen", "dlsym"}, 2),
+    "networking": ({"internetopena", "internetopenw", "internetopenurla",
+                    "urldownloadtofilea", "urldownloadtofilew", "wsastartup",
+                    "httpsendrequesta", "winhttpopen", "socket", "connect"}, 2),
+    "persistence": ({"regsetvalueexa", "regsetvalueexw", "regcreatekeyexa",
+                     "regcreatekeyexw", "createservicea", "createservicew",
+                     "startservicea"}, 2),
+    "keylogging/hooks": ({"setwindowshookexa", "setwindowshookexw",
+                          "getasynckeystate", "getkeystate", "getkeyboardstate"}, 2),
+    "crypto": ({"cryptacquirecontexta", "cryptacquirecontextw", "cryptencrypt",
+                "cryptdecrypt", "cryptgenkey", "bcryptencrypt", "bcryptdecrypt"}, 2),
+    "memory protection changes": ({"virtualprotect", "virtualprotectex", "ntprotectvirtualmemory",
+                                   "mprotect"}, 1),
+    "process execution": ({"createprocessa", "createprocessw", "shellexecutea",
+                           "shellexecutew", "winexec", "execve", "system", "fork"}, 1),
+}
+
+
+def api_findings(names):
+    low = {n.lower() for n in names}
+    out = []
+    for group, (apis, need) in API_GROUPS.items():
+        hits = sorted(low & apis)
+        if len(hits) >= need:
+            out.append(f"{group}: {', '.join(hits)}")
+    return out
+
+
+def section_findings(sections, writable, executable, normal_names):
+    out = []
+    for s in sections:
+        nm, fl = s["name"], s["flags"]
+        if not nm and s.get("type") == "NULL":
+            continue
+        if s["entropy"] > 7.2 and s.get("raw_size", s.get("size", 0)) > 512:
+            out.append(f"section {nm or '?'}: very high entropy {s['entropy']} (packed/encrypted?)")
+        if writable in fl and executable in fl:
+            out.append(f"section {nm or '?'}: writable AND executable")
+        if executable in fl and nm not in normal_names:
+            out.append(f"section {nm or '?'}: executable with non-standard name")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -176,6 +247,9 @@ class PE:
         return out
 
     def info(self):
+        imps = self.imports()
+        findings = api_findings([f for fs in imps.values() for f in fs]) + \
+            section_findings(self.sections, "W", "X", {".text", "CODE", ".code", ".init"})
         return {
             "format": f"PE{'32' if self.bits == 32 else '32+'}",
             "machine": MACHINES.get(self.machine, hex(self.machine)),
@@ -185,8 +259,10 @@ class PE:
             "entry_point_rva": f"0x{self.entry_rva:x}",
             "timestamp": self.timestamp,
             "sections": self.sections,
-            "imports": self.imports(),
+            "imphash": imphash(imps),
+            "imports": imps,
             "exports": self.exports(),
+            "findings": findings,
         }
 
 
@@ -298,6 +374,14 @@ class ELF:
     def info(self):
         imps, exps = self._dynsym()
         clean = [{k: v for k, v in s.items() if not k.startswith("_")} for s in self.sections]
+        findings = api_findings([i["name"] for i in imps]) + section_findings(
+            [c for c in clean if c["name"]], "W", "X",
+            {".text", ".init", ".fini", ".plt", ".plt.got", ".plt.sec", ".init_array"})
+        for seg in self.segments:
+            if seg["type"] == "GNU_STACK" and "X" in seg["flags"]:
+                findings.append("GNU_STACK is executable (NX disabled)")
+            if seg["type"] == "LOAD" and "W" in seg["flags"] and "X" in seg["flags"]:
+                findings.append("LOAD segment is writable AND executable")
         return {
             "format": f"ELF{64 if self.is64 else 32}",
             "machine": E_MACHINES.get(self.machine, str(self.machine)),
@@ -309,6 +393,7 @@ class ELF:
             "needed_libs": self.needed(),
             "imports": imps,
             "exports": exps,
+            "findings": findings,
         }
 
 
@@ -345,6 +430,8 @@ def print_report(r: dict, limit: int):
               f"{verdict(s['entropy'])}")
 
     imps = r["imports"]
+    if r.get("imphash"):
+        print(f"\n[*] imphash   : {r['imphash']}")
     print("\n== Imports ==")
     if isinstance(imps, dict):
         for dll, funcs in imps.items():
@@ -366,6 +453,13 @@ def print_report(r: dict, limit: int):
         print(f"  {x.get('ordinal', ''):<5} {x.get('rva', x.get('addr')):<12} {x['name']}")
     if len(r["exports"]) > limit:
         print(f"  ... +{len(r['exports']) - limit} more")
+
+    print("\n== Findings ==")
+    if r["findings"]:
+        for f in r["findings"]:
+            print(f"  [!] {f}")
+    else:
+        print("  nothing suspicious found")
 
 
 def main():

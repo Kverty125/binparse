@@ -6,6 +6,8 @@ Minimal **PE / ELF parser written from scratch** in pure Python (stdlib only, no
 - **PE** (PE32 / PE32+): COFF + optional header, sections (RWX flags), imports (by name / ordinal), exports
 - **ELF** (32/64-bit, LE/BE): header, program headers, sections, `DT_NEEDED`, `.dynsym` imports/exports
 - **Shannon entropy** per section, with a hint for likely packed/encrypted data (> 7.2)
+- **imphash** (MD5 of normalized imports, for clustering similar samples)
+- **Findings**: heuristics for suspicious API combinations (injection, anti-debug, dynamic resolving, persistence, crypto, ...), W+X sections, high-entropy sections, executable stack on ELF
 - Human-readable report or `--json`
 
 ## Usage
@@ -26,6 +28,13 @@ python binparse.py sample.dll --json > report.json
   .rdata                   14848  R--      4.921
 ```
 
+```
+== Findings ==
+  [!] anti-debug: isdebuggerpresent
+  [!] dynamic API resolving: getprocaddress, loadlibrarya, loadlibraryw
+```
+> Findings are static hints, not a verdict: legitimate software uses these APIs too.
+
 ## How it works
 Everything is parsed manually with `struct`: RVA -> file offset translation through the
 section table, import thunks (INT/IAT), export name/ordinal tables, ELF string tables
@@ -33,10 +42,11 @@ linked via `sh_link`.
 
 ## Roadmap
 - [ ] PE: resources, TLS callbacks, delay imports, rich header
-- [ ] PE: imphash
+- [x] PE: imphash
 - [ ] ELF: relocations, `.symtab`
 - [ ] Mach-O support
-- [ ] Suspicious-API heuristics (VirtualAlloc + WriteProcessMemory, etc.)
+- [x] Suspicious-API heuristics
+- [ ] Ordinal lookup tables for imphash (ws2_32, oleaut32)
 
 ## License
 MIT
